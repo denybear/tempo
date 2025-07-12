@@ -10,6 +10,7 @@ Receive messages from the input port and print them out.
 import sys
 import mido
 from mido.ports import multi_receive, multi_send
+from controlDisplay import display_grid
 
 
 # Playlist definition
@@ -17,6 +18,11 @@ playList = [
 	{"song":"Papa was a rolling stone", "artist":"Temptations", "bpm":110},
 	{"song":"I don't want a lover", "artist":"Texas", "bpm":120}
 ]
+
+# Build text list from playlist (to display on screen)
+texts = []
+for i in range (len(playList)):
+	texts.append (playList [i]["song"])
 
 
 class NovationLaunchpad:
@@ -34,11 +40,11 @@ class NovationLaunchpad:
 
 	def padToTrack (self, val):		# convert padnumber into track number: from 0x00, 0x10, etc to 0-63
 		# return (val >> 4) * 8 + (val && 0xF)
-		return (((val && 0xF0) >> 1) + (val && 0x07))
+		return (((val & 0xF0) >> 1) + (val & 0x07))
 
 	def trackToPad (self, val):		# convert track number into pad number: from 0-63 to 0x00, 0x10, etc
 		# return ((val / 8) * 0x10) + (val % 8) 
-		return (((val && 0xF0) << 1) + (val && 0x07) 
+		return (((val & 0xF0) << 1) + (val & 0x07)) 
 		
 	def __init__(self):
 		pass
@@ -76,11 +82,13 @@ displayPorts = []
 
 
 names = mido.get_input_names()
+print (names)
 for name in names:
 	if (control.name in name):
 		inPorts.append (mido.open_input(name))			# use virtual=True on non-windows systems
 
 names = mido.get_output_names()
+print (names)
 for name in names:
 	if ('tempoOUT' in name):
 		outPorts.append (mido.open_output(name))		# use virtual=True on non-windows systems
@@ -101,61 +109,75 @@ for msg in msgDisplayList:
 
 
 # main loop
+for inPort in inPorts:
+	print (f'Using IN:{inPort}')
+for outPort in outPorts:
+	print (f'Using OUT:{outPort}')
+for displayPort in displayPorts:
+	print (f'Using DISPLAY:{displayPort}')
 
-try:
 
-	for inPort in inPorts:
-		print (f'Using IN:{inPort}')
-	for outPort in outPorts:
-		print (f'Using OUT:{outPort}')
-	for displayPort in displayPorts:
-		print (f'Using DISPLAY:{displayPort}')
+running = True
+while running:
+	try:
+		for messageIn in multi_receive (inPorts):
 
-	
-	for messageIn in multi_receive (inPorts):
+			if messageIn.type in ('note_on'):		# we manage only note on events from pads
+				if messageIn.velocity == 0:			# note on with 0 velocity == note off
+					break
 
-		if messageIn.type in ('note_on')):		# we manage only note on events from pads
-			if messageIn.velocity == 0:			# note on with 0 velocity == note off
-				break
+				pad = messageIn.note
+				# convert padnumber into actual track number: from 0x00, 0x10, etc to 0-63
+				trackNumber = control.padToTrack (pad)
+				# make sure the pressed pad is in the playlist; otherwise do nothing
+				if trackNumber >= len (playList):
+					break
 
-			pad = messageIn.note
-			# convert padnumber into actual track number: from 0x00, 0x10, etc to 0-63
-			trackNumber = control.padToTrack (pad)
-			# make sure the pressed pad is in the playlist; otherwise do nothing
-			if trackNumber >= len (playList):
-				break
+				# deal with pad lighting / unlighting
+				# light pressed pad in red, previous pad in highAmber
+				# if same pad is pressed twice, it means song should be stopped
+				msgDisplayList = []
+				messageOut = []
 
-			# deal with pad lighting / unlighting
-			# light pressed pad in red, previous pad in highAmber
-			# if same pad is pressed twice, it means song should be stopped
-			msgDisplayList = []
+				if (prevPad == pad):		# same pad is pressed twice : it means stop
+					msgDisplayList.extend (control.colorPad (pad, "highAmber"))		# pressed pad becomes amber again
+					prevPad = -1
+					# also unlit the pads on the right of Novation control (used to show the rhythm)
+					msgDisplayList.extend (control.colorRightPads ("black"))
+					# send message to output (eg. reaper) indicating to stop via note-off
+					messageOut.append (mido.Message ('note_off', note = trackNumber, velocity = 0x00))
 
-			if (prevPad == pad):		# same pad is pressed twice : it means stop
-				msgDisplayList.extend (control.colorPad (pad, "highAmber"))		# pressed pad becomes amber again
-				prevPad = -1
-				# also unlit the pads on the right of Novation control (used to show the rhythm)
-				msgDisplayList.extend (control.colorRightPads ("black"))
-				# send message to output (eg. reaper) indicating to stop via note-off
-				messageOut = mido.Message ('note_off', note = trackNumber, velocity = 0x00)
+				else:
+					if (prevPad != -1):
+						msgDisplayList.extend (control.colorPad (prevPad, "highAmber"))
+					msgDisplayList.extend (control.colorPad (pad, "highRed"))
+					prevPad = pad
+					# send message to output (eg. reaper) indicating to play at the right BPM (sent as velocity = BPM/2)
+					messageOut.append (mido.Message ('note_on', note = trackNumber, velocity = (playList [trackNumber]["bpm"] >> 1)))
 
-			else:
+
+
+				# Display control surface on PC screen
+				# Set label and active cell index
 				if (prevPad != -1):
-					msgDisplayList.extend (control.colorPad (prevPad, "highAmber"))
-				msgDisplayList.extend (control.colorPad (pad, "highRed"))
-				prevPad = pad
-				# send message to output (eg. reaper) indicating to play at the right BPM (sent as velocity = BPM/2)
-				messageOut = mido.Message ('note_on', note = trackNumber, velocity = (playList [trackNumber]["bpm"] >> 1))
+					top_banner_text = playList [prevPad]["song"] + " / " + playList [prevPad]["artist"]
+				else:
+					top_banner_text = ""
 
-			
-			# send messages to midi outputs
-			for msg in msgDisplayList:
-				multi_send (displayPorts, msg)
+				# Call the display function
+				display_grid (texts, top_label= ("PLAYING: " + top_banner_text), active_cell=prevPad)
 
-			for msg in messageOut:
-				multi_send (outPorts, msg)
 
-except KeyboardInterrupt:
-	pass
+
+				# send messages to midi outputs
+				for msg in msgDisplayList:
+					multi_send (displayPorts, msg)
+
+				for msg in messageOut:
+					multi_send (outPorts, msg)
+
+	except KeyboardInterrupt:
+		running = False
 
 
 """
